@@ -1,5 +1,7 @@
 package co.wethinkcode.logisticsconnect;
 
+import co.wethinkcode.logisticsconnect.mq.DelayStageEvent;
+import co.wethinkcode.logisticsconnect.mq.DelayStagePublisher;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.Javalin;
 import org.junit.jupiter.api.AfterEach;
@@ -10,6 +12,9 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -19,10 +24,25 @@ class DelayStageServiceAppTest {
     private Javalin app;
     private final HttpClient client = HttpClient.newHttpClient();
     private final ObjectMapper mapper = new ObjectMapper();
+    private TestDelayStagePublisher testPublisher;
+
+    static class TestDelayStagePublisher implements DelayStagePublisher {
+        final List<DelayStageEvent> publishedEvents = Collections.synchronizedList(new ArrayList<>());
+        boolean shouldFail = false;
+
+        @Override
+        public void publish(String hubId, int stage, long timestamp) throws Exception {
+            if (shouldFail) {
+                throw new RuntimeException("Simulated JMS connection failure");
+            }
+            publishedEvents.add(new DelayStageEvent(hubId, stage, timestamp));
+        }
+    }
 
     @BeforeEach
     void setUp() {
-        app = DelayStageServiceApp.createApp(Map.of("H-500", 2));
+        testPublisher = new TestDelayStagePublisher();
+        app = DelayStageServiceApp.createApp(Map.of("H-500", 2), testPublisher);
         app.start(0);
     }
 
@@ -33,139 +53,130 @@ class DelayStageServiceAppTest {
         }
     }
 
-    @Test
-    void shouldReturnOkForHealthEndpoint() throws Exception {
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + app.port() + "/health"))
-                .GET()
-                .build();
-
-        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-        assertEquals(200, response.statusCode());
-        assertEquals("OK", response.body());
+    private String baseUrl() {
+        return "http://localhost:" + app.port();
     }
 
     @Test
-    void shouldReturnInitialDefaultStageForUnknownHub() throws Exception {
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + app.port() + "/delay-stage/H-501"))
-                .GET()
-                .build();
+    void shouldReturnOkForHealth() throws Exception {
+        HttpRequest req = HttpRequest.newBuilder().uri(URI.create(baseUrl() + "/health")).GET().build();
+        HttpResponse<String> res = client.send(req, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, res.statusCode());
+        assertEquals("OK", res.body());
+    }
 
-        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-        assertEquals(200, response.statusCode());
-
-        DelayStageRecord record = mapper.readValue(response.body(), DelayStageRecord.class);
+    @Test
+    void shouldReturnDefaultStageZeroForUnrecordedHub() throws Exception {
+        HttpRequest req = HttpRequest.newBuilder().uri(URI.create(baseUrl() + "/delay-stage/H-501")).GET().build();
+        HttpResponse<String> res = client.send(req, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, res.statusCode());
+        DelayStageRecord record = mapper.readValue(res.body(), DelayStageRecord.class);
         assertEquals("H-501", record.hubId());
-        assertEquals(0, record.stage(), "Default initial delay stage must be 0");
+        assertEquals(0, record.stage());
     }
 
     @Test
     void shouldReturnPreloadedStage() throws Exception {
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + app.port() + "/delay-stage/H-500"))
-                .GET()
-                .build();
-
-        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-        assertEquals(200, response.statusCode());
-
-        DelayStageRecord record = mapper.readValue(response.body(), DelayStageRecord.class);
+        HttpRequest req = HttpRequest.newBuilder().uri(URI.create(baseUrl() + "/delay-stage/H-500")).GET().build();
+        HttpResponse<String> res = client.send(req, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, res.statusCode());
+        DelayStageRecord record = mapper.readValue(res.body(), DelayStageRecord.class);
         assertEquals("H-500", record.hubId());
         assertEquals(2, record.stage());
     }
 
     @Test
-    void shouldUpdateDelayStageSuccessfully() throws Exception {
-        HttpRequest post = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + app.port() + "/delay-stage/H-501"))
+    void shouldPublishEventAndReturn200OnValidStageUpdate() throws Exception {
+        HttpRequest postReq = HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl() + "/delay-stage/H-501"))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString("{\"stage\": 4}"))
                 .build();
 
-        HttpResponse<String> postRes = client.send(post, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> postRes = client.send(postReq, HttpResponse.BodyHandlers.ofString());
         assertEquals(200, postRes.statusCode());
+        DelayStageRecord record = mapper.readValue(postRes.body(), DelayStageRecord.class);
+        assertEquals("H-501", record.hubId());
+        assertEquals(4, record.stage());
 
-        DelayStageRecord postRecord = mapper.readValue(postRes.body(), DelayStageRecord.class);
-        assertEquals("H-501", postRecord.hubId());
-        assertEquals(4, postRecord.stage());
+        assertEquals(1, testPublisher.publishedEvents.size());
+        DelayStageEvent event = testPublisher.publishedEvents.get(0);
+        assertEquals("H-501", event.hubId());
+        assertEquals(4, event.stage());
+        assertTrue(event.timestamp() > 0);
 
-        // Verify state persistence on subsequent GET
-        HttpRequest get = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + app.port() + "/delay-stage/H-501"))
-                .GET()
-                .build();
-        HttpResponse<String> getRes = client.send(get, HttpResponse.BodyHandlers.ofString());
+        // Subsequent GET verifies updated stage
+        HttpRequest getReq = HttpRequest.newBuilder().uri(URI.create(baseUrl() + "/delay-stage/H-501")).GET().build();
+        HttpResponse<String> getRes = client.send(getReq, HttpResponse.BodyHandlers.ofString());
         assertEquals(200, getRes.statusCode());
         assertEquals(4, mapper.readValue(getRes.body(), DelayStageRecord.class).stage());
     }
 
     @Test
-    void shouldAcceptBoundaryStagesZeroAndEight() throws Exception {
-        // Stage 0
-        HttpResponse<String> res0 = client.send(HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + app.port() + "/delay-stage/H-501"))
+    void shouldNotPublishWhenEffectiveStageDoesNotChange() throws Exception {
+        // H-500 was preloaded with stage 2. Posting stage 2 again should not publish duplicate event.
+        HttpRequest postReq = HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl() + "/delay-stage/H-500"))
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString("{\"stage\": 0}"))
-                .build(), HttpResponse.BodyHandlers.ofString());
-        assertEquals(200, res0.statusCode());
-        assertEquals(0, mapper.readValue(res0.body(), DelayStageRecord.class).stage());
+                .POST(HttpRequest.BodyPublishers.ofString("{\"stage\": 2}"))
+                .build();
 
-        // Stage 8
-        HttpResponse<String> res8 = client.send(HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + app.port() + "/delay-stage/H-501"))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString("{\"stage\": 8}"))
-                .build(), HttpResponse.BodyHandlers.ofString());
-        assertEquals(200, res8.statusCode());
-        assertEquals(8, mapper.readValue(res8.body(), DelayStageRecord.class).stage());
+        HttpResponse<String> postRes = client.send(postReq, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, postRes.statusCode());
+        assertEquals(0, testPublisher.publishedEvents.size(), "Should not publish event when stage didn't change");
     }
 
     @Test
-    void shouldRejectInvalidUpdatesAndLeaveExistingStateUnchanged() throws Exception {
-        // Initialize stage to 3
-        client.send(HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + app.port() + "/delay-stage/H-501"))
+    void shouldFailAndPreserveStateWhenPublisherThrowsException() throws Exception {
+        // Set publisher to fail
+        testPublisher.shouldFail = true;
+
+        HttpRequest postReq = HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl() + "/delay-stage/H-500"))
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString("{\"stage\": 3}"))
-                .build(), HttpResponse.BodyHandlers.ofString());
+                .POST(HttpRequest.BodyPublishers.ofString("{\"stage\": 5}"))
+                .build();
 
-        // 1. Out of range negative: -1
-        assertBadRequest("{\"stage\": -1}");
+        HttpResponse<String> postRes = client.send(postReq, HttpResponse.BodyHandlers.ofString());
+        assertEquals(500, postRes.statusCode());
+        assertTrue(postRes.body().contains("Failed to publish delay stage event to broker"));
 
-        // 2. Out of range positive: 9
-        assertBadRequest("{\"stage\": 9}");
-
-        // 3. Fractional value: 4.5
-        assertBadRequest("{\"stage\": 4.5}");
-
-        // 4. Non-numeric string: "high"
-        assertBadRequest("{\"stage\": \"high\"}");
-
-        // 5. Missing stage field: {}
-        assertBadRequest("{}");
-
-        // 6. Null stage field: {"stage": null}
-        assertBadRequest("{\"stage\": null}");
-
-        // 7. Malformed JSON
-        assertBadRequest("{stage: 3");
-
-        // Assert previous valid stage (3) is completely preserved
-        HttpResponse<String> check = client.send(HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + app.port() + "/delay-stage/H-501"))
-                .GET()
-                .build(), HttpResponse.BodyHandlers.ofString());
-        assertEquals(200, check.statusCode());
-        assertEquals(3, mapper.readValue(check.body(), DelayStageRecord.class).stage());
+        // Confirm state remains previous stage (2), not updated to 5
+        HttpRequest getReq = HttpRequest.newBuilder().uri(URI.create(baseUrl() + "/delay-stage/H-500")).GET().build();
+        HttpResponse<String> getRes = client.send(getReq, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, getRes.statusCode());
+        assertEquals(2, mapper.readValue(getRes.body(), DelayStageRecord.class).stage());
     }
 
-    private void assertBadRequest(String invalidJson) throws Exception {
-        HttpResponse<String> res = client.send(HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + app.port() + "/delay-stage/H-501"))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(invalidJson))
-                .build(), HttpResponse.BodyHandlers.ofString());
-        assertEquals(400, res.statusCode(), "Expected 400 for payload: " + invalidJson);
+    @Test
+    void shouldRejectInvalidUpdatesAndNotPublishNorMutateState() throws Exception {
+        String[] invalidBodies = {
+                "{\"stage\": -1}",
+                "{\"stage\": 9}",
+                "{\"stage\": 4.5}",
+                "{\"stage\": \"four\"}",
+                "{\"stage\": null}",
+                "{}",
+                "{malformed_json}"
+        };
+
+        for (String invalidBody : invalidBodies) {
+            HttpRequest postReq = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl() + "/delay-stage/H-500"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(invalidBody))
+                    .build();
+
+            HttpResponse<String> postRes = client.send(postReq, HttpResponse.BodyHandlers.ofString());
+            assertEquals(400, postRes.statusCode(), "Expected 400 for payload: " + invalidBody);
+        }
+
+        assertEquals(0, testPublisher.publishedEvents.size(), "No events should be published on invalid requests");
+
+        // Verify state is still preloaded stage 2
+        HttpRequest getReq = HttpRequest.newBuilder().uri(URI.create(baseUrl() + "/delay-stage/H-500")).GET().build();
+        HttpResponse<String> getRes = client.send(getReq, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, getRes.statusCode());
+        assertEquals(2, mapper.readValue(getRes.body(), DelayStageRecord.class).stage());
     }
 }

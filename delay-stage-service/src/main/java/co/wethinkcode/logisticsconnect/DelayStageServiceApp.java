@@ -3,6 +3,8 @@ package co.wethinkcode.logisticsconnect;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import co.wethinkcode.logisticsconnect.mq.ActiveMqDelayStagePublisher;
+import co.wethinkcode.logisticsconnect.mq.DelayStagePublisher;
 import io.javalin.Javalin;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,14 +20,29 @@ public class DelayStageServiceApp {
     public static final int DEFAULT_INITIAL_STAGE = 0;
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final Object UPDATE_LOCK = new Object();
 
     public static Javalin createApp(Map<String, Integer> initialStages) {
+        return createApp(initialStages, new ActiveMqDelayStagePublisher());
+    }
+
+    public static Javalin createApp(Map<String, Integer> initialStages, DelayStagePublisher publisher) {
         Map<String, Integer> stageStore = new ConcurrentHashMap<>();
         if (initialStages != null) {
             stageStore.putAll(initialStages);
         }
 
         Javalin app = Javalin.create();
+
+        if (publisher != null) {
+            app.events(event -> event.serverStopped(() -> {
+                try {
+                    publisher.close();
+                } catch (Exception e) {
+                    log.warn("Error closing publisher on server stop: {}", e.getMessage());
+                }
+            }));
+        }
 
         app.get("/health", ctx -> ctx.result("OK"));
 
@@ -87,10 +104,32 @@ public class DelayStageServiceApp {
                 return;
             }
 
-            stageStore.put(canonicalId, newStage);
-            log.info("Updated delay stage for hub {} to {}", canonicalId, newStage);
+            synchronized (UPDATE_LOCK) {
+                int currentStage = stageStore.getOrDefault(canonicalId, DEFAULT_INITIAL_STAGE);
+                if (currentStage == newStage && stageStore.containsKey(canonicalId)) {
+                    // No effective stage change
+                    ctx.status(200).json(new DelayStageRecord(canonicalId, currentStage));
+                    return;
+                }
 
-            ctx.status(200).json(new DelayStageRecord(canonicalId, newStage));
+                long timestamp = System.currentTimeMillis();
+                if (publisher != null) {
+                    try {
+                        publisher.publish(canonicalId, newStage, timestamp);
+                    } catch (Exception e) {
+                        log.error("Failed to publish stage update for hub {} to broker: {}", canonicalId, e.getMessage());
+                        ctx.status(500).json(Map.of(
+                            "error", "Failed to publish delay stage event to broker",
+                            "details", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()
+                        ));
+                        return;
+                    }
+                }
+
+                stageStore.put(canonicalId, newStage);
+                log.info("Updated delay stage for hub {} to {} (ts={})", canonicalId, newStage, timestamp);
+                ctx.status(200).json(new DelayStageRecord(canonicalId, newStage));
+            }
         });
 
         return app;
@@ -98,7 +137,9 @@ public class DelayStageServiceApp {
 
     public static void main(String[] args) {
         log.info("Starting DelayStageServiceApp on port {}...", DEFAULT_PORT);
-        Javalin app = createApp(null);
+        ActiveMqDelayStagePublisher publisher = new ActiveMqDelayStagePublisher();
+        Javalin app = createApp(null, publisher);
+        Runtime.getRuntime().addShutdownHook(new Thread(publisher::close));
         app.start(DEFAULT_PORT);
     }
 }
