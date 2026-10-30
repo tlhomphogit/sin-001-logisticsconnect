@@ -1,12 +1,12 @@
 package co.wethinkcode.logisticsconnect;
 
-import com.fasterxml.jackson.databind.JsonNode;
+import co.wethinkcode.logisticsconnect.mq.DelayStageEvent;
+import co.wethinkcode.logisticsconnect.mq.TransitDelaySubscriber;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.Javalin;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -14,13 +14,13 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 
 public class TransitServiceApp {
 
     private static final Logger log = LoggerFactory.getLogger(TransitServiceApp.class);
     public static final int DEFAULT_PORT = 7053;
     public static final String DEFAULT_HUB_SERVICE_URL = "http://localhost:7051";
-    public static final String DEFAULT_DELAY_STAGE_SERVICE_URL = "http://localhost:7052";
 
     public static final int BASE_TRANSIT_HOURS = 24;
     public static final int DELAY_HOURS_PER_STAGE = 6;
@@ -39,19 +39,25 @@ public class TransitServiceApp {
         return DEFAULT_HUB_SERVICE_URL;
     }
 
-    public static String resolveDelayStageServiceUrl() {
-        String sys = System.getProperty("delay.stage.service.base.url");
-        if (sys != null && !sys.isBlank()) return sys.trim();
-        String env = System.getenv("DELAY_STAGE_SERVICE_BASE_URL");
-        if (env != null && !env.isBlank()) return env.trim();
-        return DEFAULT_DELAY_STAGE_SERVICE_URL;
+    public static Javalin createApp(String hubServiceUrl, TransitDelayCache cache) {
+        return createApp(hubServiceUrl, cache, null);
     }
 
-    public static Javalin createApp(String hubServiceUrl, String delayStageServiceUrl) {
+    public static Javalin createApp(String hubServiceUrl, TransitDelayCache cache, AutoCloseable subscriber) {
         String cleanHubUrl = hubServiceUrl.replaceAll("/+$", "");
-        String cleanDelayUrl = delayStageServiceUrl.replaceAll("/+$", "");
+        TransitDelayCache delayCache = cache != null ? cache : new TransitDelayCache();
 
         Javalin app = Javalin.create();
+
+        if (subscriber != null) {
+            app.events(event -> event.serverStopped(() -> {
+                try {
+                    subscriber.close();
+                } catch (Exception e) {
+                    log.warn("Error closing subscriber on server stop: {}", e.getMessage());
+                }
+            }));
+        }
 
         app.get("/health", ctx -> ctx.result("OK"));
 
@@ -99,42 +105,19 @@ public class TransitServiceApp {
                 return;
             }
 
-            // 2. Fetch Delay Stage from Delay Stage Service
-            String stageReqUrl = cleanDelayUrl + "/delay-stage/" + canonicalId;
-            int stage;
-            try {
-                HttpRequest stageReq = HttpRequest.newBuilder()
-                        .uri(URI.create(stageReqUrl))
-                        .timeout(Duration.ofSeconds(5))
-                        .GET()
-                        .build();
-                HttpResponse<String> stageRes = HTTP_CLIENT.send(stageReq, HttpResponse.BodyHandlers.ofString());
-
-                if (stageRes.statusCode() != 200) {
-                    ctx.status(502).json(Map.of(
-                        "error", "Upstream delay-stage-service error",
-                        "status", stageRes.statusCode(),
-                        "details", stageRes.body()
-                    ));
-                    return;
-                }
-                JsonNode stageJson = OBJECT_MAPPER.readTree(stageRes.body());
-                if (!stageJson.has("stage") || !stageJson.get("stage").isInt()) {
-                    ctx.status(502).json(Map.of(
-                        "error", "Malformed response from delay-stage-service",
-                        "details", "Missing or non-integer 'stage' property"
-                    ));
-                    return;
-                }
-                stage = stageJson.get("stage").asInt();
-            } catch (Exception e) {
-                log.error("Failed to query delay-stage-service for {}: {}", canonicalId, e.getMessage());
-                ctx.status(502).json(Map.of(
-                    "error", "Failed to connect to upstream delay-stage-service",
-                    "details", e.getMessage()
+            // 2. Fetch Delay Stage from local ActiveMQ subscriber cache (no HTTP to delay-stage-service)
+            Optional<DelayStageEvent> cachedOpt = delayCache.get(canonicalId);
+            if (cachedOpt.isEmpty()) {
+                log.warn("Delay stage not established in local cache for hub {}", canonicalId);
+                ctx.status(503).json(Map.of(
+                    "error", "Delay stage unavailable",
+                    "message", "No delay stage event received for hub: " + canonicalId,
+                    "hubId", canonicalId
                 ));
                 return;
             }
+
+            int stage = cachedOpt.get().stage();
 
             // 3. Compute ETA Arrival Window
             int delayHours = stage * DELAY_HOURS_PER_STAGE;
@@ -163,11 +146,19 @@ public class TransitServiceApp {
 
     public static void main(String[] args) {
         String hubUrl = resolveHubServiceUrl();
-        String delayUrl = resolveDelayStageServiceUrl();
-        log.info("Starting TransitServiceApp on port {} (HubService: {}, DelayStageService: {})...",
-            DEFAULT_PORT, hubUrl, delayUrl);
+        log.info("Starting TransitServiceApp on port {} (HubService: {})...", DEFAULT_PORT, hubUrl);
 
-        Javalin app = createApp(hubUrl, delayUrl);
+        TransitDelayCache cache = new TransitDelayCache();
+        TransitDelaySubscriber subscriber = new TransitDelaySubscriber(cache);
+
+        try {
+            subscriber.start();
+        } catch (Exception e) {
+            log.error("Failed to connect ActiveMQ subscriber on startup: {}", e.getMessage(), e);
+        }
+
+        Javalin app = createApp(hubUrl, cache, subscriber);
+        Runtime.getRuntime().addShutdownHook(new Thread(subscriber::close));
         app.start(DEFAULT_PORT);
     }
 }

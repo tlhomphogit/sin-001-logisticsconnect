@@ -1,5 +1,7 @@
 package co.wethinkcode.logisticsconnect;
 
+import co.wethinkcode.logisticsconnect.mq.DelayStageEvent;
+import co.wethinkcode.logisticsconnect.mq.TransitDelaySubscriber;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.Javalin;
 import org.junit.jupiter.api.AfterEach;
@@ -17,33 +19,31 @@ import static org.junit.jupiter.api.Assertions.*;
 class TransitServiceAppTest {
 
     private Javalin mockHubService;
-    private Javalin mockDelayService;
     private Javalin transitApp;
+    private TransitDelayCache cache;
     private final HttpClient client = HttpClient.newHttpClient();
     private final ObjectMapper mapper = new ObjectMapper();
 
     @BeforeEach
     void setUp() {
-        // Mock Hub Service
+        // Mock Hub Service (no mock delay service required in Stage 3)
         mockHubService = Javalin.create()
                 .get("/hubs/H-501", ctx -> ctx.json(new HubRecord("H-501", "Western Cape", "Cape Town Port", true)))
                 .get("/hubs/H-508", ctx -> ctx.json(new HubRecord("H-508", null, "Pretoria North", true)))
-                .get("/hubs/H-BAD", ctx -> ctx.json(new HubRecord("H-BAD", "Gauteng", "Pretoria North", true)))
+                .get("/hubs/H-NOSTAGE", ctx -> ctx.json(new HubRecord("H-NOSTAGE", "Gauteng", "Centurion Hub", true)))
                 .get("/hubs/H-999", ctx -> ctx.status(404).json(Map.of("error", "Hub not found")))
                 .get("/hubs/H-ERR", ctx -> ctx.status(500).result("Internal error"));
         mockHubService.start(0);
 
-        // Mock Delay Stage Service
-        mockDelayService = Javalin.create()
-                .get("/delay-stage/H-501", ctx -> ctx.json(Map.of("hubId", "H-501", "stage", 4)))
-                .get("/delay-stage/H-508", ctx -> ctx.json(Map.of("hubId", "H-508", "stage", 0)))
-                .get("/delay-stage/H-BAD", ctx -> ctx.result("not json"));
-        mockDelayService.start(0);
+        // Preload local delay cache with stage 4 for H-501, stage 0 for H-508
+        cache = new TransitDelayCache();
+        cache.put(new DelayStageEvent("H-501", 4, 1000L));
+        cache.put(new DelayStageEvent("H-508", 0, 1000L));
 
-        // Transit Service App under test
+        // Transit Service App under test (uses cached state, no delay-stage HTTP dependency)
         transitApp = TransitServiceApp.createApp(
                 "http://localhost:" + mockHubService.port(),
-                "http://localhost:" + mockDelayService.port()
+                cache
         );
         transitApp.start(0);
     }
@@ -52,13 +52,16 @@ class TransitServiceAppTest {
     void tearDown() {
         if (transitApp != null) transitApp.stop();
         if (mockHubService != null) mockHubService.stop();
-        if (mockDelayService != null) mockDelayService.stop();
+    }
+
+    private String transitUrl() {
+        return "http://localhost:" + transitApp.port();
     }
 
     @Test
     void shouldReturnOkForHealthEndpoint() throws Exception {
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + transitApp.port() + "/health"))
+                .uri(URI.create(transitUrl() + "/health"))
                 .GET()
                 .build();
 
@@ -68,9 +71,9 @@ class TransitServiceAppTest {
     }
 
     @Test
-    void shouldCalculateEtaCorrectlyForKnownHub() throws Exception {
+    void shouldCalculateEtaCorrectlyFromCachedStage() throws Exception {
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + transitApp.port() + "/transit/H-501"))
+                .uri(URI.create(transitUrl() + "/transit/H-501"))
                 .GET()
                 .build();
 
@@ -93,7 +96,7 @@ class TransitServiceAppTest {
     @Test
     void shouldPreserveNullProvinceForH508InTransitResponse() throws Exception {
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + transitApp.port() + "/transit/H-508"))
+                .uri(URI.create(transitUrl() + "/transit/H-508"))
                 .GET()
                 .build();
 
@@ -113,7 +116,7 @@ class TransitServiceAppTest {
     @Test
     void shouldReturn404WhenHubServiceReturns404() throws Exception {
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + transitApp.port() + "/transit/H-999"))
+                .uri(URI.create(transitUrl() + "/transit/H-999"))
                 .GET()
                 .build();
 
@@ -125,7 +128,7 @@ class TransitServiceAppTest {
     @Test
     void shouldReturn502WhenHubServiceFails() throws Exception {
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + transitApp.port() + "/transit/H-ERR"))
+                .uri(URI.create(transitUrl() + "/transit/H-ERR"))
                 .GET()
                 .build();
 
@@ -134,13 +137,92 @@ class TransitServiceAppTest {
     }
 
     @Test
-    void shouldReturn502WhenDelayStageServiceReturnsMalformedData() throws Exception {
+    void shouldReturn503WhenDelayStageIsNotEstablishedInCache() throws Exception {
+        // H-NOSTAGE exists in hub-service but has not received any delay event
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + transitApp.port() + "/transit/H-BAD"))
+                .uri(URI.create(transitUrl() + "/transit/H-NOSTAGE"))
                 .GET()
                 .build();
 
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-        assertEquals(502, response.statusCode(), "Malformed dependency payload must return 502");
+        assertEquals(503, response.statusCode(), "Missing event must return 503 unavailable");
+        assertTrue(response.body().contains("Delay stage unavailable"));
+    }
+
+    @Test
+    void shouldUpdateCacheAndEtaOnValidNewerEventIncludingDecreasingStage() throws Exception {
+        // Initially H-501 is stage 4 at ts 1000
+        assertEquals(4, cache.get("H-501").orElseThrow().stage());
+
+        // Update with newer event lowering stage to 1 at ts 2000
+        boolean updated = cache.updateIfNewer(new DelayStageEvent("H-501", 1, 2000L));
+        assertTrue(updated);
+        assertEquals(1, cache.get("H-501").orElseThrow().stage());
+
+        // Transit query now returns lower ETA window
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(transitUrl() + "/transit/H-501"))
+                .GET()
+                .build();
+
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, response.statusCode());
+
+        TransitResponse transit = mapper.readValue(response.body(), TransitResponse.class);
+        assertEquals(1, transit.stage());
+        assertEquals(6, transit.delayHours());
+        assertEquals(30, transit.minEstimatedHours());
+        assertEquals(38, transit.maxEstimatedHours());
+        assertEquals("30-38 hours", transit.estimatedArrivalWindow());
+    }
+
+    @Test
+    void shouldRejectStaleAndDuplicateEventsInCache() {
+        // Current state for H-501 is ts 1000, stage 4
+        assertFalse(cache.updateIfNewer(new DelayStageEvent("H-501", 6, 500L)), "Stale event must be rejected");
+        assertEquals(4, cache.get("H-501").orElseThrow().stage(), "Stage must remain 4");
+
+        assertFalse(cache.updateIfNewer(new DelayStageEvent("H-501", 6, 1000L)), "Duplicate event must be rejected");
+        assertEquals(4, cache.get("H-501").orElseThrow().stage(), "Stage must remain 4");
+    }
+
+    @Test
+    void shouldValidateAndParseEventPayloadsCorrectly() {
+        // Valid epoch millis
+        DelayStageEvent ev1 = TransitDelaySubscriber.parseAndValidate("{\"hubId\":\"H-501\",\"stage\":3,\"timestamp\":1730000000000}");
+        assertNotNull(ev1);
+        assertEquals("H-501", ev1.hubId());
+        assertEquals(3, ev1.stage());
+        assertEquals(1730000000000L, ev1.timestamp());
+
+        // Valid ISO-8601 timestamp string
+        DelayStageEvent ev2 = TransitDelaySubscriber.parseAndValidate("{\"hubId\":\"h-502\",\"stage\":0,\"timestamp\":\"2026-07-18T10:15:00Z\"}");
+        assertNotNull(ev2);
+        assertEquals("H-502", ev2.hubId());
+        assertEquals(0, ev2.stage());
+        assertTrue(ev2.timestamp() > 0);
+
+        // Invalid: missing stage
+        assertNull(TransitDelaySubscriber.parseAndValidate("{\"hubId\":\"H-501\",\"timestamp\":1000}"));
+
+        // Invalid: non-integer stage
+        assertNull(TransitDelaySubscriber.parseAndValidate("{\"hubId\":\"H-501\",\"stage\":4.5,\"timestamp\":1000}"));
+        assertNull(TransitDelaySubscriber.parseAndValidate("{\"hubId\":\"H-501\",\"stage\":\"four\",\"timestamp\":1000}"));
+
+        // Invalid: stage out of range
+        assertNull(TransitDelaySubscriber.parseAndValidate("{\"hubId\":\"H-501\",\"stage\":-1,\"timestamp\":1000}"));
+        assertNull(TransitDelaySubscriber.parseAndValidate("{\"hubId\":\"H-501\",\"stage\":9,\"timestamp\":1000}"));
+
+        // Invalid: missing/blank hubId
+        assertNull(TransitDelaySubscriber.parseAndValidate("{\"stage\":3,\"timestamp\":1000}"));
+        assertNull(TransitDelaySubscriber.parseAndValidate("{\"hubId\":\"   \",\"stage\":3,\"timestamp\":1000}"));
+
+        // Invalid: missing or negative timestamp
+        assertNull(TransitDelaySubscriber.parseAndValidate("{\"hubId\":\"H-501\",\"stage\":3}"));
+        assertNull(TransitDelaySubscriber.parseAndValidate("{\"hubId\":\"H-501\",\"stage\":3,\"timestamp\":-5}"));
+        assertNull(TransitDelaySubscriber.parseAndValidate("{\"hubId\":\"H-501\",\"stage\":3,\"timestamp\":\"invalid-date\"}"));
+
+        // Invalid: malformed JSON
+        assertNull(TransitDelaySubscriber.parseAndValidate("{not-json}"));
     }
 }
