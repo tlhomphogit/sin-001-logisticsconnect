@@ -5,7 +5,7 @@
 Calculates estimated arrival windows (ETAs) based on hub identity and current delay stages.
 Part of the [LogisticsConnect](../README.md) project. Independent Maven module, no parent POM.
 
-MQ integration note: This service subscribes to the ActiveMQ topic `package-status-topic` via `co.wethinkcode.logisticsconnect.mq.MqConfig` (Stage 3).
+In Stage 3, `transit-service` is decoupled from `delay-stage-service`: it subscribes to ActiveMQ topic `package-status-topic` via `TransitDelaySubscriber` and maintains a thread-safe local cache (`TransitDelayCache`), eliminating runtime HTTP RPC to `delay-stage-service`.
 
 ## REST API Endpoints
 
@@ -16,7 +16,7 @@ MQ integration note: This service subscribes to the ActiveMQ topic `package-stat
 - **Description**: Computes estimated transit duration and arrival window for a package passing through the given hub.
 - **Upstream Dependencies**:
   1. `hub-service` (`GET /hubs/{hubId}`) — queries place-name and operational status.
-  2. `delay-stage-service` (`GET /delay-stage/{hubId}`) — queries current delay stage.
+  2. `TransitDelayCache` (local in-memory cache) — queried for the latest delay stage received from ActiveMQ topic `package-status-topic`.
 - **Success Response**: `200 OK`
   ```json
   {
@@ -49,8 +49,16 @@ MQ integration note: This service subscribes to the ActiveMQ topic `package-stat
   }
   ```
 - **Error Responses**:
-  - `404 Not Found`: Propagated when the queried `hubId` does not exist in `hub-service`.
-  - `502 Bad Gateway`: Returned when `hub-service` or `delay-stage-service` cannot be reached, times out, or returns invalid/malformed payloads.
+  - `404 Not Found`: Returned when the queried `hubId` does not exist in `hub-service`.
+  - `502 Bad Gateway`: Returned when upstream `hub-service` cannot be reached or returns an error.
+  - `503 Service Unavailable`: Returned when the queried hub exists in `hub-service`, but no delay stage event has been received in the local cache:
+    ```json
+    {
+      "error": "Delay stage unavailable",
+      "message": "No delay stage event received for hub: H-501",
+      "hubId": "H-501"
+    }
+    ```
 
 ## Transit Calculation Formula
 
@@ -60,11 +68,38 @@ MQ integration note: This service subscribes to the ActiveMQ topic `package-stat
 - **Maximum Estimated Hours**: `maxEstimatedHours = minEstimatedHours + 8` (8-hour operational buffer window).
 - **Estimated Arrival Window**: Formatted as `"{minEstimatedHours}-{maxEstimatedHours} hours"`.
 
-## Configuration & Resiliency
+## Asynchronous Decoupling & Caching Architecture
 
-- **Hub Service Base URL**: Configurable via system property `hub.service.base.url` or environment variable `HUB_SERVICE_BASE_URL`. Defaults to `http://localhost:7051`.
-- **Delay Stage Service Base URL**: Configurable via system property `delay.stage.service.base.url` or environment variable `DELAY_STAGE_SERVICE_BASE_URL`. Defaults to `http://localhost:7052`.
-- **Bounded Timeouts**: All upstream REST calls use bounded 5-second connection and read timeouts.
+### 1. Event Ingestion & Validation
+`TransitDelaySubscriber` listens for JMS `TextMessage` updates on `package-status-topic`. Each message must satisfy:
+- Valid JSON object with `hubId`, `stage`, and `timestamp`.
+- Non-blank string `hubId` (canonicalized to uppercase).
+- Integer `stage` between `0` and `8` inclusive.
+- Positive `timestamp` (numeric epoch milliseconds or ISO-8601 string).
+- Malformed payloads, invalid stages, or missing fields are logged and dropped without interrupting subsequent message processing.
+
+### 2. Ordering & Deduplication Policy
+Events are applied atomically to `TransitDelayCache` using `cache.compute()`:
+- **Newer Event**: If `incoming.timestamp > existing.timestamp`, the stage is updated. A newer event may legitimately decrease the delay stage (e.g., weather clearing from stage 4 down to stage 1).
+- **Stale or Duplicate Event**: If `incoming.timestamp <= existing.timestamp`, the event is discarded as outdated or duplicate, preserving existing state.
+
+### 3. Startup, Missing-Event, and Restart Behavior
+- **Recommended Startup Order**:
+  1. ActiveMQ Broker (`common/docker-compose.yml`)
+  2. `ingestion-service` (:7050)
+  3. `hub-service` (:7051)
+  4. `transit-service` (:7053) — subscriber begins listening to topic
+  5. `delay-stage-service` (:7052) — updates publish to active subscriber
+- **Missing-Event Behavior**: If a hub has not yet received any event from the broker, `GET /transit/{hubId}` returns `503 Service Unavailable`, preventing the emission of arbitrary or ungrounded ETAs.
+- **In-Memory State Limitations**: The delay cache is non-persistent in this stage. If `transit-service` restarts, all previously cached stages in memory are cleared until new events are broadcast on the ActiveMQ topic.
+
+## Configuration
+
+| Setting | System Property | Environment Variable | Default |
+| :--- | :--- | :--- | :--- |
+| Hub Service Base URL | `hub.service.base.url` | `HUB_SERVICE_BASE_URL` | `http://localhost:7051` |
+| ActiveMQ Broker URL | `activemq.broker.url` | `ACTIVEMQ_BROKER_URL` | `tcp://localhost:61616` |
+| ActiveMQ Topic Name | `activemq.topic` | `ACTIVEMQ_TOPIC` | `package-status-topic` |
 
 ## Project Structure
 
@@ -74,12 +109,16 @@ transit-service/
 └── src/
     ├── main/java/co/wethinkcode/logisticsconnect/
     │   ├── HubRecord.java
+    │   ├── TransitDelayCache.java
     │   ├── TransitResponse.java
     │   ├── TransitServiceApp.java
     │   └── mq/
-    │       └── MqConfig.java
+    │       ├── DelayStageEvent.java
+    │       ├── MqConfig.java
+    │       └── TransitDelaySubscriber.java
     └── test/java/co/wethinkcode/logisticsconnect/
-        └── TransitServiceAppTest.java
+        ├── TransitServiceAppTest.java
+        └── TransitServiceMqIT.java
 ```
 
 ## Build
@@ -90,10 +129,18 @@ mvn -f transit-service/pom.xml clean package
 
 ## Test
 
-Runs JUnit 5 test suite with mocked Javalin upstream servers (no external network or Docker required):
+### 1. Default Unit Tests (No Broker Required)
+Runs JUnit 5 test suite with preloaded/mock cache (no broker or Docker needed):
 
 ```bash
-mvn -f transit-service/pom.xml test
+mvn -f transit-service/pom.xml clean verify
+```
+
+### 2. Integration Tests (Requires ActiveMQ Broker)
+Runs integration test suite `*IT` validating live ActiveMQ message delivery, parsing, cache updates, and ETA calculation on an isolated topic:
+
+```bash
+mvn -f transit-service/pom.xml -Pintegration-tests clean verify
 ```
 
 ## Run
